@@ -3,7 +3,7 @@
  * Supports all color types (0,2,3,4,6), all filter types, sub-byte bit depths.
  * No external dependencies.
  */
-import { inflate } from './inflate';
+import { decompressSync } from 'fflate';
 
 export interface DecodedImage {
   width: number;
@@ -53,7 +53,7 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
   let pos = 0;
   for (const c of idat) { comp.set(c, pos); pos += c.length; }
 
-  const raw = inflate(comp);
+  const raw = decompressSync(comp);
 
   // Channel count per pixel
   const ch = cType === 2 ? 3 : cType === 6 ? 4 : cType === 4 ? 2 : 1;
