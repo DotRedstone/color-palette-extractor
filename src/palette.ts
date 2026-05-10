@@ -164,9 +164,9 @@ export function extractPalette(
   const k = Math.min(numColors, sampled.length);
   const clusters = kmeans(sampled, k);
 
-  // Sort by population desc, filter tiny clusters (< 0.5%)
+  // Sort by population desc, filter tiny clusters (< 0.5% of sampled pixels)
   clusters.sort((a, b) => b.count - a.count);
-  const minPop = totalPx * 0.005;
+  const minPop = sampled.length * 0.005;
   const filtered = clusters.filter(c => c.count >= minPop);
 
   // Build palette
