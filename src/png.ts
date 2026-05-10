@@ -1,9 +1,9 @@
 /**
  * PNG decoder — reads raw RGB pixels from a PNG file.
  * Supports all color types (0,2,3,4,6), all filter types, sub-byte bit depths.
- * No external dependencies.
+ * When maxDim is set, performs inline downscaling during decode to save memory.
  */
-import { decompressSync } from 'fflate';
+import { decompressSync, Decompress } from 'fflate';
 
 export interface DecodedImage {
   width: number;
@@ -11,7 +11,19 @@ export interface DecodedImage {
   pixels: Uint8Array; // RGB, 3 bytes per pixel
 }
 
-export function decodePNG(buf: Uint8Array): DecodedImage {
+// Paeth predictor
+const paeth = (a: number, b: number, c: number): number => {
+  const p = a + b - c;
+  const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+};
+
+/**
+ * Decode PNG with optional inline downscaling.
+ * When maxDim is set and image exceeds it, only keeps scaled rows/columns
+ * during scanline processing, avoiding the full pixel buffer.
+ */
+export function decodePNG(buf: Uint8Array, maxDim = 0): DecodedImage {
   // Verify signature
   const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   for (let i = 0; i < 8; i++) if (buf[i] !== sig[i]) throw new Error('Not a PNG');
@@ -29,8 +41,8 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
     if (type === 'IHDR') {
       w = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
       h = (data[4] << 24 | data[5] << 16 | data[6] << 8 | data[7]) >>> 0;
-      bpc = data[8]; // bit depth
-      cType = data[9]; // color type
+      bpc = data[8];
+      cType = data[9];
     } else if (type === 'PLTE') {
       for (let i = 0; i < data.length; i += 3) {
         palette.push([data[i], data[i + 1], data[i + 2]]);
@@ -46,6 +58,17 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
 
   if (w === 0 || h === 0) throw new Error('Invalid PNG');
 
+  // Determine if we need to downscale
+  const needScale = maxDim > 0 && Math.max(w, h) > maxDim;
+  const scale = needScale ? maxDim / Math.max(w, h) : 1;
+  const outW = needScale ? Math.round(w * scale) : w;
+  const outH = needScale ? Math.round(h * scale) : h;
+
+  // Channel count per pixel
+  const ch = cType === 2 ? 3 : cType === 6 ? 4 : cType === 4 ? 2 : 1;
+  const bpp = Math.max(1, Math.ceil((bpc * ch) / 8));
+  const stride = 1 + w * bpp;
+
   // Concatenate IDAT data
   let total = 0;
   for (const c of idat) total += c.length;
@@ -53,21 +76,56 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
   let pos = 0;
   for (const c of idat) { comp.set(c, pos); pos += c.length; }
 
+  // Decompress
   const raw = decompressSync(comp);
 
-  // Channel count per pixel
-  const ch = cType === 2 ? 3 : cType === 6 ? 4 : cType === 4 ? 2 : 1;
-  const bpp = Math.max(1, Math.ceil((bpc * ch) / 8)); // bytes per pixel in raw
-  const stride = 1 + w * bpp; // +1 for filter byte
+  // Allocate output — only if not scaling, or if scaling but output is small
+  const pixels = new Uint8Array(outW * outH * 3);
 
-  // Paeth predictor
-  const paeth = (a: number, b: number, c: number): number => {
-    const p = a + b - c;
-    const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
-    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  // Helper: extract RGB from unfiltered scanline at a given x position
+  const extractRGB = (cur: Uint8Array, x: number): [number, number, number] => {
+    if (cType === 3) {
+      let idx: number;
+      if (bpc === 8) idx = cur[x];
+      else {
+        const bitOff = x * bpc;
+        const mask = (1 << bpc) - 1;
+        idx = (cur[Math.floor(bitOff / 8)] >> (8 - bpc - (bitOff % 8))) & mask;
+      }
+      return palette[idx] || [0, 0, 0];
+    } else if (bpc === 8) {
+      const px = x * ch;
+      return [cur[px], ch >= 2 ? cur[px + 1] : cur[px], ch >= 3 ? cur[px + 2] : cur[px]];
+    } else if (bpc === 16) {
+      const px = x * ch * 2;
+      return [cur[px], ch >= 2 ? cur[px + 2] : cur[px], ch >= 3 ? cur[px + 4] : cur[px]];
+    } else {
+      const bitsPerPx = bpc * Math.min(ch, 3);
+      const bitOff = x * bitsPerPx;
+      const mask = (1 << bpc) - 1;
+      const scale2 = 255 / mask;
+      const read = (channelOffset: number): number => {
+        const bo = bitOff + channelOffset * bpc;
+        return Math.round(((cur[Math.floor(bo / 8)] >> (8 - bpc - (bo % 8))) & mask) * scale2);
+      };
+      return [read(0), ch >= 2 ? read(1) : read(0), ch >= 3 ? read(2) : read(0)];
+    }
   };
 
-  const pixels = new Uint8Array(w * h * 3);
+  // Precompute target column indices (which source x maps to which output x)
+  const targetCols: number[] = [];
+  if (needScale) {
+    // For each output column, compute the source column
+    const seen = new Set<number>();
+    for (let ox = 0; ox < outW; ox++) {
+      const sx = Math.min(Math.round(ox / scale), w - 1);
+      if (!seen.has(sx)) {
+        targetCols.push(sx);
+        seen.add(sx);
+      }
+    }
+  }
+
   let prev = new Uint8Array(w * bpp);
 
   for (let y = 0; y < h; y++) {
@@ -75,7 +133,7 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
     const filt = raw[scan];
     const cur = raw.slice(scan + 1, scan + 1 + w * bpp);
 
-    // Unfilter
+    // Unfilter (always, needed for filter reconstruction)
     for (let x = 0; x < w * bpp; x++) {
       const rawVal = cur[x];
       const a = x >= bpp ? cur[x - bpp] : 0;
@@ -89,45 +147,36 @@ export function decodePNG(buf: Uint8Array): DecodedImage {
       else if (filt === 4) cur[x] = (rawVal + paeth(a, b, c)) & 0xff;
     }
 
-    // Extract RGB
-    for (let x = 0; x < w; x++) {
-      let r: number, g: number, bl: number;
+    // Check if this source row maps to an output row
+    const outY = needScale ? Math.round(y * scale) : y;
+    const isTargetRow = !needScale || (outY < outH && y === Math.round(outY / scale));
 
-      if (cType === 3) {
-        // Indexed — read palette index
-        let idx: number;
-        if (bpc === 8) idx = cur[x];
-        else {
-          const bitOff = x * bpc;
-          const mask = (1 << bpc) - 1;
-          idx = (cur[Math.floor(bitOff / 8)] >> (8 - bpc - (bitOff % 8))) & mask;
+    if (isTargetRow) {
+      if (needScale) {
+        // Extract only target columns
+        const seen = new Set<number>();
+        let outX = 0;
+        for (let ox = 0; ox < outW && outX < outW; ox++) {
+          const sx = Math.min(Math.round(ox / scale), w - 1);
+          if (!seen.has(sx + '_' + y)) {
+            const [r, g, b] = extractRGB(cur, sx);
+            const oi = (outY * outW + ox) * 3;
+            pixels[oi] = r; pixels[oi + 1] = g; pixels[oi + 2] = b;
+            seen.add(sx + '_' + y);
+          }
         }
-        [r, g, bl] = palette[idx] || [0, 0, 0];
-      } else if (bpc === 8) {
-        const px = x * ch;
-        r = cur[px]; g = ch >= 2 ? cur[px + 1] : r; bl = ch >= 3 ? cur[px + 2] : r;
-      } else if (bpc === 16) {
-        const px = x * ch * 2;
-        r = cur[px]; g = ch >= 2 ? cur[px + 2] : r; bl = ch >= 3 ? cur[px + 4] : r;
       } else {
-        // Sub-byte (1, 2, 4 bit)
-        const bitsPerPx = bpc * Math.min(ch, 3);
-        const bitOff = x * bitsPerPx;
-        const mask = (1 << bpc) - 1;
-        const scale = 255 / mask;
-        const read = (channelOffset: number): number => {
-          const bo = bitOff + channelOffset * bpc;
-          return Math.round(((cur[Math.floor(bo / 8)] >> (8 - bpc - (bo % 8))) & mask) * scale);
-        };
-        r = read(0); g = ch >= 2 ? read(1) : r; bl = ch >= 3 ? read(2) : r;
+        // No scaling — extract all columns
+        for (let x = 0; x < w; x++) {
+          const [r, g, b] = extractRGB(cur, x);
+          const oi = (y * w + x) * 3;
+          pixels[oi] = r; pixels[oi + 1] = g; pixels[oi + 2] = b;
+        }
       }
-
-      const oi = (y * w + x) * 3;
-      pixels[oi] = r; pixels[oi + 1] = g; pixels[oi + 2] = bl;
     }
 
     prev = cur;
   }
 
-  return { width: w, height: h, pixels };
+  return { width: outW, height: outH, pixels };
 }

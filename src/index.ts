@@ -47,23 +47,25 @@ export default {
         if (!resp.ok) return json({ error: `Failed to fetch image: ${resp.status}` }, 400);
         const buf = new Uint8Array(await resp.arrayBuffer());
 
-        // Detect format & decode
+        // Parameters
+        const numColors = typeof body.numColors === 'number' ? body.numColors : 8;
+        const maxDim = typeof body.maxDim === 'number' ? body.maxDim : 512;
+
+        // Detect format & decode (with inline downscaling)
         const isPNG = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
         const isJPEG = buf[0] === 0xff && buf[1] === 0xd8;
 
         let decoded: { width: number; height: number; pixels: Uint8Array };
         if (isPNG) {
-          decoded = decodePNG(buf);
+          decoded = decodePNG(buf, maxDim);
         } else if (isJPEG) {
-          decoded = decodeJPEG(buf);
+          decoded = decodeJPEG(buf, maxDim);
         } else {
           return json({ error: 'Unsupported format. Use PNG or JPEG.' }, 400);
         }
 
-        // Extract palette
-        const numColors = typeof body.numColors === 'number' ? body.numColors : 8;
-        const maxDim = typeof body.maxDim === 'number' ? body.maxDim : 512;
-        const result = extractPalette(decoded.pixels, decoded.width, decoded.height, numColors, maxDim);
+        // Extract palette (already resized by decoder)
+        const result = extractPalette(decoded.pixels, decoded.width, decoded.height, numColors);
         result.processingTimeMs = Date.now() - t0;
 
         return json({ success: true, data: result });

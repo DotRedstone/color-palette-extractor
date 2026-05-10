@@ -1,44 +1,4 @@
 /**
- * Downsample pixel array to fit within maxDim.
- * Uses area averaging for quality.
- */
-function resizePixels(
-  pixels: Uint8Array, srcW: number, srcH: number, maxDim: number
-): { pixels: Uint8Array; width: number; height: number } {
-  if (srcW <= maxDim && srcH <= maxDim) return { pixels, width: srcW, height: srcH };
-
-  const scale = maxDim / Math.max(srcW, srcH);
-  const dstW = Math.round(srcW * scale);
-  const dstH = Math.round(srcH * scale);
-  const out = new Uint8Array(dstW * dstH * 3);
-
-  for (let dy = 0; dy < dstH; dy++) {
-    for (let dx = 0; dx < dstW; dx++) {
-      // Source region
-      const sx0 = Math.floor(dx / scale);
-      const sy0 = Math.floor(dy / scale);
-      const sx1 = Math.min(Math.floor((dx + 1) / scale), srcW - 1);
-      const sy1 = Math.min(Math.floor((dy + 1) / scale), srcH - 1);
-      const area = (sx1 - sx0 + 1) * (sy1 - sy0 + 1);
-
-      let r = 0, g = 0, b = 0;
-      for (let sy = sy0; sy <= sy1; sy++) {
-        for (let sx = sx0; sx <= sx1; sx++) {
-          const i = (sy * srcW + sx) * 3;
-          r += pixels[i]; g += pixels[i + 1]; b += pixels[i + 2];
-        }
-      }
-      const oi = (dy * dstW + dx) * 3;
-      out[oi] = Math.round(r / area);
-      out[oi + 1] = Math.round(g / area);
-      out[oi + 2] = Math.round(b / area);
-    }
-  }
-
-  return { pixels: out, width: dstW, height: dstH };
-}
-
-/**
  * Color palette extraction from raw RGB pixel data.
  * Uses k-means++ clustering, HSL analysis, role assignment.
  */
@@ -174,27 +134,21 @@ export function extractPalette(
   pixels: Uint8Array,
   width: number,
   height: number,
-  numColors = 8,
-  maxDim = 512
+  numColors = 8
 ): PaletteResult {
-  // Downsample large images to save memory and CPU
-  const resized = resizePixels(pixels, width, height, maxDim);
-  const procPixels = resized.pixels;
-  const procW = resized.width;
-  const procH = resized.height;
-  const totalPx = procW * procH;
+  const totalPx = width * height;
 
   // Sample pixels for speed
   let sampled: [number, number, number][] = [];
   if (totalPx <= 10000) {
     for (let i = 0; i < totalPx; i++) {
-      sampled.push([procPixels[i * 3], procPixels[i * 3 + 1], procPixels[i * 3 + 2]]);
+      sampled.push([pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2]]);
     }
   } else {
     const step = totalPx / 10000;
     for (let i = 0; i < totalPx; i += step) {
       const idx = Math.floor(i) * 3;
-      sampled.push([procPixels[idx], procPixels[idx + 1], procPixels[idx + 2]]);
+      sampled.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
     }
   }
 
