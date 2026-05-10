@@ -62,7 +62,8 @@ export default {
 
         // Extract palette
         const numColors = typeof body.numColors === 'number' ? body.numColors : 8;
-        const result = extractPalette(decoded.pixels, decoded.width, decoded.height, numColors);
+        const maxDim = typeof body.maxDim === 'number' ? body.maxDim : 512;
+        const result = extractPalette(decoded.pixels, decoded.width, decoded.height, numColors, maxDim);
         result.processingTimeMs = Date.now() - t0;
 
         return json({ success: true, data: result });
